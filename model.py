@@ -22,19 +22,6 @@ import tensorflow as tf
 _BATCH_NORM_DECAY = 0.997
 _BATCH_NORM_EPSILON = 1e-5
 
-
-def batch_norm_relu(inputs, is_training, data_format):
-  """Performs a batch normalization followed by a ReLU."""
-  # We set fused=True for a significant performance boost. See
-  # https://www.tensorflow.org/performance/performance_guide#common_fused_ops
-  inputs = tf.layers.batch_normalization(
-    inputs=inputs, axis=1 if data_format == 'channels_first' else 3,
-    momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=True,
-    scale=True, training=is_training, fused=True)
-  inputs = tf.nn.relu(inputs)
-  return inputs
-
-
 def fixed_padding(inputs, kernel_size, data_format):
   """Pads the input along the spatial dimensions independently of input size.
 
@@ -67,7 +54,7 @@ def conv2d_fixed_padding(inputs, filters, kernel_size, strides, data_format):
   # The padding is consistent and is based only on `kernel_size`, not on the
   # dimensions of `inputs` (as opposed to using `tf.layers.conv2d` alone).
   if strides > 1:
-  inputs = fixed_padding(inputs, kernel_size, data_format)
+    inputs = fixed_padding(inputs, kernel_size, data_format)
 
   return tf.layers.conv2d(
     inputs=inputs, filters=filters, kernel_size=kernel_size, strides=strides,
@@ -75,46 +62,21 @@ def conv2d_fixed_padding(inputs, filters, kernel_size, strides, data_format):
     kernel_initializer=tf.variance_scaling_initializer(),
     data_format=data_format)
 
+def separable_conv2d(inputs, filters, kernel_size, strides, data_format):
+  if strides > 1:
+    inputs = fixed_padding(inputs, kernel_size, data_format)
 
+  inputs = tf.nn.relu(inputs)
 
-def block_layer(inputs, filters, block_fn, blocks, strides, is_training, name,
-        data_format):
-  """Creates one layer of blocks for the ResNet model.
+  inputs = tf.layers.separable_conv2d(
+    inputs=inputs, )
 
-  Args:
-  inputs: A tensor of size [batch, channels, height_in, width_in] or
-    [batch, height_in, width_in, channels] depending on data_format.
-  filters: The number of filters for the first convolution of the layer.
-  block_fn: The block to use within the model, either `building_block` or
-    `bottleneck_block`.
-  blocks: The number of blocks contained in the layer.
-  strides: The stride to use for the first convolution of the layer. If
-    greater than 1, this layer will ultimately downsample the input.
-  is_training: Either True or False, whether we are currently training the
-    model. Needed for batch norm.
-  name: A string name for the tensor output of the block layer.
-  data_format: The input format ('channels_last' or 'channels_first').
+  inputs = tf.layers.batch_normalization(
+    inputs=inputs, axis=1 if data_format == 'channels_first' else 3,
+    momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=True,
+    scale=True, training=is_training, fused=True)
 
-  Returns:
-  The output tensor of the block layer.
-  """
-
-  def projection_shortcut(inputs):
-  return conv2d_fixed_padding(
-    inputs=inputs, filters=filters_out, kernel_size=1, strides=strides,
-    data_format=data_format)
-
-  # Only the first block per block_layer uses projection_shortcut and strides
-  inputs = block_fn(inputs, filters, is_training, projection_shortcut, strides,
-          data_format)
-
-  for _ in range(1, blocks):
-  inputs = block_fn(inputs, filters, is_training, None, 1, data_format)
-
-  return tf.identity(inputs, name)
-
-def node(inputs1, inputs2, op1, op2):
-  pass
+  return inputs
 
 def convolutional_cell(last_inputs, inputs, params):
   # node 1 and node 2 are last_inputs and inputs respectively
@@ -188,6 +150,7 @@ def build_model(num_blocks, num_cells, num_nodes, num_classes, data_format=None)
     'num_blocks': num_blocks,
     'num_cells': num_cells,
     'num_nodes': num_nodes,
+    'data_format': data_format,
     'is_training': is_training,
   }
 
