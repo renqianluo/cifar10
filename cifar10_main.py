@@ -24,7 +24,7 @@ import sys
 
 import tensorflow as tf
 
-import resnet_model
+import model
 
 parser = argparse.ArgumentParser()
 
@@ -34,9 +34,6 @@ parser.add_argument('--data_dir', type=str, default='/tmp/cifar10_data',
 
 parser.add_argument('--model_dir', type=str, default='/tmp/cifar10_model',
                     help='The directory where the model will be stored.')
-
-parser.add_argument('--resnet_size', type=int, default=32,
-                    help='The size of the ResNet model to use.')
 
 parser.add_argument('--train_epochs', type=int, default=250,
                     help='The number of epochs to train.')
@@ -54,6 +51,18 @@ parser.add_argument(
          'provides a performance boost on GPU but is not always compatible '
          'with CPU. If left unspecified, the data format will be chosen '
          'automatically based on whether TensorFlow was built for CPU or GPU.')
+
+parser.add_argument('--lr_max', type=float, default=0.05,
+                    help='Max learning rate.')
+
+parser.add_argument('--lr_min', type=float, default=0.001,
+                    help='Min learning rate.')
+
+parser.add_argument('--T_0', type=int, default=10,
+                    help='Epochs of the first cycle.')
+
+parser.add_argument('--T_mul', type=int, default=2,
+                    help='Multiplicator for the cycle.')
 
 _HEIGHT = 32
 _WIDTH = 32
@@ -184,8 +193,12 @@ def cifar10_model_fn(features, labels, mode, params):
   """Model function for CIFAR-10."""
   tf.summary.image('images', features, max_outputs=6)
 
-  network = resnet_model.cifar10_resnet_v2_generator(
-      params['resnet_size'], _NUM_CLASSES, params['data_format'])
+  network = model.net(
+    num_blocks = 1,
+    num_cells = 6,
+    num_nodes = 7,
+    num_classes = _NUM_CLASSES,
+    data_format = params['data_format'])
 
   inputs = tf.reshape(features, [-1, _HEIGHT, _WIDTH, _DEPTH])
   logits = network(inputs, mode == tf.estimator.ModeKeys.TRAIN)
@@ -213,15 +226,22 @@ def cifar10_model_fn(features, labels, mode, params):
   if mode == tf.estimator.ModeKeys.TRAIN:
     # Scale the learning rate linearly with the batch size. When the batch size
     # is 128, the learning rate should be 0.1.
-    initial_learning_rate = 0.1 * params['batch_size'] / 128
+    lr_max = params['lr_max']
+    lr_min = params['lr_min']
+    T_0 = params['T_0']
+    T_mul = params['T_mul']
     batches_per_epoch = _NUM_IMAGES['train'] / params['batch_size']
+    
     global_step = tf.train.get_or_create_global_step()
-
-    # Multiply the learning rate by 0.1 at 100, 150, and 200 epochs.
-    boundaries = [int(batches_per_epoch * epoch) for epoch in [100, 150, 200]]
-    values = [initial_learning_rate * decay for decay in [1, 0.1, 0.01, 0.001]]
-    learning_rate = tf.train.piecewise_constant(
-        tf.cast(global_step, tf.int32), boundaries, values)
+    cur_epoch = global_step * batches_per_epoch + 1
+    cur_i = tf.ceil(tf.log((T_mul - 1) * (cur_epoch / T_0 + 1)) / tf.log(2.0) - 1)
+    cur_i = tf.cast(cur_i, dtype=tf.int32)
+    T_beg = T_0 * (tf.pow(T_mul, cur_i) - 1) / (T_mul - 1)
+    T_i = T_0 * tf.pow(T_mul, cur_i)
+    T_end = T_beg + T_end
+    
+    T_cur = cur_epoch - T_beg
+    learning_rate = lr_min + 0.5 * (lr_max - lr_min) * (1 + tf.cos(T_cur / T_i * np.pi))
 
     # Create a tensor named learning_rate for logging purposes
     tf.identity(learning_rate, name='learning_rate')
@@ -263,9 +283,12 @@ def main(unused_argv):
   cifar_classifier = tf.estimator.Estimator(
       model_fn=cifar10_model_fn, model_dir=FLAGS.model_dir, config=run_config,
       params={
-          'resnet_size': FLAGS.resnet_size,
           'data_format': FLAGS.data_format,
           'batch_size': FLAGS.batch_size,
+          'T_0': FLAGS.T_0,
+          'T_mul': FLAGS.T_mul,
+          'lr_max': FLAGS.lr_max,
+          'lr_min': FLAGS.lr_min
       })
 
   for _ in range(FLAGS.train_epochs // FLAGS.epochs_per_eval):

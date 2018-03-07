@@ -41,35 +41,25 @@ def fixed_padding(inputs, kernel_size, data_format):
   pad_end = pad_total - pad_beg
 
   if data_format == 'channels_first':
-  padded_inputs = tf.pad(inputs, [[0, 0], [0, 0],
+    padded_inputs = tf.pad(inputs, [[0, 0], [0, 0],
                   [pad_beg, pad_end], [pad_beg, pad_end]])
   else:
-  padded_inputs = tf.pad(inputs, [[0, 0], [pad_beg, pad_end],
+    padded_inputs = tf.pad(inputs, [[0, 0], [pad_beg, pad_end],
                   [pad_beg, pad_end], [0, 0]])
   return padded_inputs
 
-
-def conv2d_fixed_padding(inputs, filters, kernel_size, strides, data_format):
-  """Strided 2-D convolution with explicit padding."""
-  # The padding is consistent and is based only on `kernel_size`, not on the
-  # dimensions of `inputs` (as opposed to using `tf.layers.conv2d` alone).
-  if strides > 1:
-    inputs = fixed_padding(inputs, kernel_size, data_format)
-
-  return tf.layers.conv2d(
-    inputs=inputs, filters=filters, kernel_size=kernel_size, strides=strides,
-    padding=('SAME' if strides == 1 else 'VALID'), use_bias=False,
-    kernel_initializer=tf.variance_scaling_initializer(),
-    data_format=data_format)
-
-def separable_conv2d(inputs, filters, kernel_size, strides, data_format):
+def separable_conv2d(inputs, filters, kernel_size, strides, data_format, is_training):
   if strides > 1:
     inputs = fixed_padding(inputs, kernel_size, data_format)
 
   inputs = tf.nn.relu(inputs)
 
   inputs = tf.layers.separable_conv2d(
-    inputs=inputs, )
+    inputs=inputs, filters=filters, kernel_size=kernel_size, strides=strides,
+    padding=('SAME' if strides == 1 else 'VALID'), use_bias=False,
+    depthwise_initializer=tf.variance_scaling_initializer(),
+    pointwise_initializer=tf.variance_scaling_initializer(),
+    data_format=data_format)
 
   inputs = tf.layers.batch_normalization(
     inputs=inputs, axis=1 if data_format == 'channels_first' else 3,
@@ -78,40 +68,54 @@ def separable_conv2d(inputs, filters, kernel_size, strides, data_format):
 
   return inputs
 
+def average_pooling2d(inputs, pool_size, strides, data_format):
+  if strides > 1:
+    inputs = fixed_padding(inputs, pool_size, data_format)
+
+  inputs = tf.layers.average_pooling2d(
+    inputs=inputs, pool_size=pool_size, strides=strides,
+    padding=('SAME' if strides == 1 else 'VALID'),
+    data_format=data_format)
+  return inputs
+
 def convolutional_cell(last_inputs, inputs, params):
   # node 1 and node 2 are last_inputs and inputs respectively
   # begin processing from node 3
-  output = []
-  node = separable_conv2d(inputs) + tf.identity(inputs)
-  output.append(node)
-  node = separable_conv2d(inputs) + tf.identity(last_inputs)
-  output.append(node)
-  node = tf.average_pooling2d(last_inputs) + separable_conv2d(inputs)
-  output.append(node)
-  node = separable_conv2d(last_inputs) + tf.average_pooling2d(inputs)
-  output.append(node)
-  node = separable_conv2d(inputs) + tf.average_pooling2d(last_inputs)
-  output.append(node)
+  data_format = params['data_format']
+  is_training = params['is_training']
+  node1 = last_inputs
+  node2 = inputs
+  node3 = separable_conv2d(node2, 36, 3, 1, data_format, is_training) + tf.identity(node2)
+  node4 = separable_conv2d(node2, 36, 5, 1, data_format, is_training) + tf.identity(node1)
+  node5 = average_pooling2d(node1, 3, 1, data_format) + separable_conv2d(node2, None, 3, 1, data_format, is_training)
+  node6 = separable_conv2d(node1, 36, 3, 1, data_format, is_training) + average_pooling2d(node2, 3, 1, data_format)
+  node7 = separable_conv2d(node2, 36, 3, 1, data_format, is_training) + average_pooling2d(node1, 3, 1, data_format)
 
-  output = tf.concat(output, axis=-1)
+  output = tf.concat([node3, node4, node5, node6, node7], axis=1 if data_format == 'channels_first' else 3)
   return inputs, output
   
 
 def reduction_cell(last_inputs, inputs, params):
   # node 1 and node 2 are last_inputs and inputs respectively
   # begin processing from node 3
-  node3 = separable_conv2d(last_inputs) + tf.average_pooling2d(inputs)
-  node4 = separable_conv2d(inputs) + tf.average_pooling2d(inputs)
-  node5 = tf.average_pooling2d(inputs) + separable_conv2d(inputs)
-  node6 = separable_conv2d(node5) + separable_conv2d(inputs)
-  node7 = separable_conv2d(node6) + separable_conv2d(last_inputs)
-  output = tf.concat([node3, node4, node7], axis=-1)
+  data_format = params['data_format']
+  is_training = params['is_training']
+  node1 = last_inputs
+  node2 = inputs
+  node3 = separable_conv2d(node1, 36, 5, 2, data_format, is_training) + average_pooling2d(node2, 3, 2, data_format)
+  node4 = separable_conv2d(node2, 36, 3, 2, data_format, is_training) + average_pooling2d(node2, 3, 2, data_format)
+  node5 = average_pooling2d(node2, 3, 2, data_format) + separable_conv2d(node2, None, 3, 2, data_format, is_training)
+  node6 = separable_conv2d(node5, 36, 5, 2, data_format, is_training) + average_pooling2d(node2, 3, 2, data_format)
+  node7 = separable_conv2d(node6, 36, 3, 2, data_format, is_training) + separable_conv2d(node1, None, 5, 2, data_format, is_training)
+  output = tf.concat([node3, node4, node7], axis=1 if data_format == 'channels_first' else 3)
   return inputs, output
 
 def build_block(inputs, params):
   num_cells = params['num_cells']
-  for _ in xrange(num_cells):
-    last_inputs, inputs = convolutional_cell(last_inputs=inputs, inputs=inputs, params=params)
+  # first convolution_cell
+  last_inputs, inputs = convolution_cell(last_inputs=inputs, inputs=inputs, params=params)
+  for _ in xrange(1, num_cells):
+    last_inputs, inputs = convolution_cell(last_inputs=last_inputs, inputs=inputs, params=params)
   last_inputs, inputs = reduction_cell(last_inputs=last_inputs, inputs=inputs, params=params)
   return inputs
 
@@ -119,7 +123,7 @@ def build_model(num_blocks, num_cells, num_nodes, num_classes, data_format=None)
   """Generator for net.
 
   Args:
-  num_cells: A single integer for the number of blocks.
+  num_blocks: A single integer for the number of blocks.
   num_cells: A single integer for the number of convolution cells.
   num_nodes: A single integer for the number of nodes.
   num_classes: The number of possible classes for image classification.
@@ -128,57 +132,35 @@ def build_model(num_blocks, num_cells, num_nodes, num_classes, data_format=None)
 
   Returns:
   The model function that takes in `inputs` and `is_training` and
-  returns the output tensor of the ResNet model.
-
-  Raises:
-  ValueError: If `resnet_size` is invalid.
+  returns the output tensor of the model.
   """
 
   if data_format is None:
-  data_format = (
-    'channels_first' if tf.test.is_built_with_cuda() else 'channels_last')
+    data_format = (
+      'channels_first' if tf.test.is_built_with_cuda() else 'channels_last')
 
   def model(inputs, is_training):
-  """Constructs the ResNet model given the inputs."""
-  if data_format == 'channels_first':
-    # Convert the inputs from channels_last (NHWC) to channels_first (NCHW).
-    # This provides a large performance boost on GPU. See
-    # https://www.tensorflow.org/performance/performance_guide#data_formats
-    inputs = tf.transpose(inputs, [0, 3, 1, 2])
+    if data_format == 'channels_first':
+      # Convert the inputs from channels_last (NHWC) to channels_first (NCHW).
+      # This provides a large performance boost on GPU. See
+      # https://www.tensorflow.org/performance/performance_guide#data_formats
+      inputs = tf.transpose(inputs, [0, 3, 1, 2])
 
-  params = {
-    'num_blocks': num_blocks,
-    'num_cells': num_cells,
-    'num_nodes': num_nodes,
-    'data_format': data_format,
-    'is_training': is_training,
-  }
+    params = {
+      'num_blocks': num_blocks,
+      'num_cells': num_cells,
+      'num_nodes': num_nodes,
+      'data_format': data_format,
+      'is_training': is_training,
+    }
 
-  inputs = build_block(inputs=inputs, params=params)
-  inputs = tf.layers.average_pooling2d(
-    inputs=inputs, pool_size=8, strides=1, padding='VALID', data_format=data_format)
-  inputs = tf.identity(inputs, 'final_avg_pool')
-  inputs = tf.reshape(inputs, [-1, 64])
-  inputs = tf.layers.dense(inputs=inputs, units=num_classes)
-  inputs = tf.identity(inputs, 'final_dense')
-  return inputs
-
-  inputs = conv2d_fixed_padding(
-    inputs=inputs, filters=16, kernel_size=3, strides=1,
-    data_format=data_format)
-  inputs = tf.identity(inputs, 'initial_conv')
-
-  inputs = block_layer(
-    inputs=inputs, filters=16, block_fn=building_block, blocks=num_blocks,
-    strides=1, is_training=is_training, name='block_layer1',
-    data_format=data_format)
-  inputs = block_layer(
-    inputs=inputs, filters=32, block_fn=building_block, blocks=num_blocks,
-    strides=2, is_training=is_training, name='block_layer2',
-    data_format=data_format)
-  inputs = block_layer(
-    inputs=inputs, filters=64, block_fn=building_block, blocks=num_blocks,
-    strides=2, is_training=is_training, name='block_layer3',
-    data_format=data_format)
+    inputs = build_block(inputs=inputs, params=params)
+    inputs = tf.layers.average_pooling2d(
+      inputs=inputs, pool_size=16, strides=1, padding='VALID', data_format=data_format)
+    inputs = tf.identity(inputs, 'final_avg_pool')
+    inputs = tf.reshape(inputs, [-1, 256])
+    inputs = tf.layers.dense(inputs=inputs, units=num_classes)
+    inputs = tf.identity(inputs, 'final_dense')
+    return inputs
 
   return model
