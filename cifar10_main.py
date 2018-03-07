@@ -193,7 +193,7 @@ def cifar10_model_fn(features, labels, mode, params):
   """Model function for CIFAR-10."""
   tf.summary.image('images', features, max_outputs=6)
 
-  network = model.net(
+  network = model.build_model(
     num_blocks = 1,
     num_cells = 6,
     num_nodes = 7,

@@ -48,6 +48,13 @@ def fixed_padding(inputs, kernel_size, data_format):
                   [pad_beg, pad_end], [0, 0]])
   return padded_inputs
 
+def batch_normalization(inputs, data_format, is_training):
+  inputs = tf.layers.batch_normalization(
+    inputs=inputs, axis=1 if data_format == 'channels_first' else 3,
+    momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=True,
+    scale=True, training=is_training, fused=True)
+  return inputs
+
 def separable_conv2d(inputs, filters, kernel_size, strides, data_format, is_training):
   if strides > 1:
     inputs = fixed_padding(inputs, kernel_size, data_format)
@@ -61,11 +68,7 @@ def separable_conv2d(inputs, filters, kernel_size, strides, data_format, is_trai
     pointwise_initializer=tf.variance_scaling_initializer(),
     data_format=data_format)
 
-  inputs = tf.layers.batch_normalization(
-    inputs=inputs, axis=1 if data_format == 'channels_first' else 3,
-    momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=True,
-    scale=True, training=is_training, fused=True)
-
+  inputs = batch_normalization(inputs, data_format, is_training)
   return inputs
 
 def average_pooling2d(inputs, pool_size, strides, data_format):
@@ -78,20 +81,31 @@ def average_pooling2d(inputs, pool_size, strides, data_format):
     data_format=data_format)
   return inputs
 
-def convolutional_cell(last_inputs, inputs, params):
+def convolution_cell(last_inputs, inputs, params):
   # node 1 and node 2 are last_inputs and inputs respectively
   # begin processing from node 3
   data_format = params['data_format']
   is_training = params['is_training']
   node1 = last_inputs
   node2 = inputs
-  node3 = separable_conv2d(node2, 36, 3, 1, data_format, is_training) + tf.identity(node2)
-  node4 = separable_conv2d(node2, 36, 5, 1, data_format, is_training) + tf.identity(node1)
-  node5 = average_pooling2d(node1, 3, 1, data_format) + separable_conv2d(node2, None, 3, 1, data_format, is_training)
-  node6 = separable_conv2d(node1, 36, 3, 1, data_format, is_training) + average_pooling2d(node2, 3, 1, data_format)
-  node7 = separable_conv2d(node2, 36, 3, 1, data_format, is_training) + average_pooling2d(node1, 3, 1, data_format)
+  node3 = separable_conv2d(node2, 64, 3, 1, data_format, is_training) + \
+    tf.identity(node2)
+  node4 = separable_conv2d(node2, 64, 5, 1, data_format, is_training) + \
+    tf.identity(node1)
+  node5 = average_pooling2d(node1, 3, 1, data_format) + \
+    separable_conv2d(node2, 64, 3, 1, data_format, is_training)
+  node6 = separable_conv2d(node1, 64, 3, 1, data_format, is_training) + \
+    average_pooling2d(node2, 3, 1, data_format)
+  node7 = separable_conv2d(node2, 64, 3, 1, data_format, is_training) + \
+    average_pooling2d(node1, 3, 1, data_format)
 
   output = tf.concat([node3, node4, node5, node6, node7], axis=1 if data_format == 'channels_first' else 3)
+  output = tf.layers.conv2d(
+    inputs=output, filters=64, kernel_size=1, strides=1,
+    padding='SAME', use_bias=False,
+    kernel_initializer=tf.variance_scaling_initializer(),
+    data_format=data_format)
+  output = tf.nn.relu(batch_normalization(output, data_format, is_training))
   return inputs, output
   
 
@@ -102,16 +116,35 @@ def reduction_cell(last_inputs, inputs, params):
   is_training = params['is_training']
   node1 = last_inputs
   node2 = inputs
-  node3 = separable_conv2d(node1, 36, 5, 2, data_format, is_training) + average_pooling2d(node2, 3, 2, data_format)
-  node4 = separable_conv2d(node2, 36, 3, 2, data_format, is_training) + average_pooling2d(node2, 3, 2, data_format)
-  node5 = average_pooling2d(node2, 3, 2, data_format) + separable_conv2d(node2, None, 3, 2, data_format, is_training)
-  node6 = separable_conv2d(node5, 36, 5, 2, data_format, is_training) + average_pooling2d(node2, 3, 2, data_format)
-  node7 = separable_conv2d(node6, 36, 3, 2, data_format, is_training) + separable_conv2d(node1, None, 5, 2, data_format, is_training)
+  node3 = separable_conv2d(node1, 64, 5, 2, data_format, is_training) + \
+    average_pooling2d(node2, 3, 2, data_format)
+  node4 = separable_conv2d(node2, 64, 3, 2, data_format, is_training) + \
+    average_pooling2d(node2, 3, 2, data_format)
+  node5 = average_pooling2d(node2, 64, 2, data_format) + \
+    separable_conv2d(node2, 64, 3, 2, data_format, is_training)
+  node6 = separable_conv2d(node5, 64, 5, 2, data_format, is_training) + \
+    average_pooling2d(node2, 3, 2, data_format)
+  node7 = separable_conv2d(node6, 64, 3, 2, data_format, is_training) + 
+    separable_conv2d(node1, 64, 5, 2, data_format, is_training)
   output = tf.concat([node3, node4, node7], axis=1 if data_format == 'channels_first' else 3)
+  output = tf.layers.conv2d(
+    inputs=output, filters=64, kernel_size=1, strides=1,
+    padding='SAME', use_bias=False,
+    kernel_initializer=tf.variance_scaling_initializer(),
+    data_format=data_format)
+  output = tf.nn.relu(batch_normalization(output, data_format, is_training))
   return inputs, output
 
 def build_block(inputs, params):
   num_cells = params['num_cells']
+  data_format = params['data_format']
+  is_training = params['is_training']
+  inputs = tf.layers.conv2d(
+    inputs=inputs, filters=64, kernel_size=1, strides=1,
+    padding='SAME', use_bias=False,
+    kernel_initializer=tf.variance_scaling_initializer(),
+    data_format=data_format)
+  inputs = tf.nn.relu(batch_normalization(inputs, data_format, is_training))
   # first convolution_cell
   last_inputs, inputs = convolution_cell(last_inputs=inputs, inputs=inputs, params=params)
   for _ in xrange(1, num_cells):
