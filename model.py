@@ -124,7 +124,7 @@ def reduction_cell(last_inputs, inputs, params):
     separable_conv2d(node2, 64, 3, 2, data_format, is_training)
   node6 = separable_conv2d(node5, 64, 5, 2, data_format, is_training) + \
     average_pooling2d(node2, 3, 2, data_format)
-  node7 = separable_conv2d(node6, 64, 3, 2, data_format, is_training) + 
+  node7 = separable_conv2d(node6, 64, 3, 2, data_format, is_training) + \ 
     separable_conv2d(node1, 64, 5, 2, data_format, is_training)
   output = tf.concat([node3, node4, node7], axis=1 if data_format == 'channels_first' else 3)
   output = tf.layers.conv2d(
