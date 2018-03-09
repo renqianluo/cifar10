@@ -17,10 +17,22 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+from six.moves import xrange
+from collections import namedtuple
 import tensorflow as tf
 
 _BATCH_NORM_DECAY = 0.997
 _BATCH_NORM_EPSILON = 1e-5
+
+_OPERATIONS={
+  'identity': lambda inputs, filters, strides, data_format, is_training : tf.identity(inputs),
+  'sep_conv 5x5': lambda inputs, filters, strides, data_format, is_training : separable_conv2d(inputs, filters, 5, strides, data_format, is_training),
+  'sep_conv 3x3': lambda inputs, filters, strides, data_format, is_training : separable_conv2d(inputs, filters, 3, strides, data_format, is_training),
+  'avg_pool 3x3': lambda inputs, filters, strides, data_format, is_training : average_pooling2d(inputs, 3, strides, data_format),
+  'max_pool 3x3': lambda inputs, filters, strides, data_format, is_training : max_pooling2d(inputs, 3, strides, data_format),
+}
+
+Node = namedtuple('Node', ['name', 'previous_node_1', 'previous_node_2', 'operation_1', 'operation_2'])
 
 def fixed_padding(inputs, kernel_size, data_format):
   """Pads the input along the spatial dimensions independently of input size.
@@ -69,6 +81,9 @@ def separable_conv2d(inputs, filters, kernel_size, strides, data_format, is_trai
     data_format=data_format)
 
   inputs = batch_normalization(inputs, data_format, is_training)
+
+  if strides > 1:
+
   return inputs
 
 def average_pooling2d(inputs, pool_size, strides, data_format):
@@ -81,119 +96,172 @@ def average_pooling2d(inputs, pool_size, strides, data_format):
     data_format=data_format)
   return inputs
 
-def convolution_cell(last_inputs, inputs, params):
+def max_pooling2d(inputs, pool_size, strides, data_format):
+  if strides > 1:
+    inputs = fixed_padding(inputs, pool_size, data_format)
+
+  inputs = tf.layers.max_pooling2d(
+    inputs=inputs, pool_size=pool_size, strides=strides,
+    padding=('SAME' if strides == 1 else 'VALID'),
+    data_format=data_format)
+  return inputs
+
+def convolution_cell(last_inputs, inputs, params, is_training):
   # node 1 and node 2 are last_inputs and inputs respectively
   # begin processing from node 3
+  num_nodes = params['num_nodes']
   data_format = params['data_format']
-  is_training = params['is_training']
-  node1 = last_inputs
-  node2 = inputs
-  node3 = separable_conv2d(node2, 64, 3, 1, data_format, is_training) + \
-    tf.identity(node2)
-  node4 = separable_conv2d(node2, 64, 5, 1, data_format, is_training) + \
-    tf.identity(node1)
-  node5 = average_pooling2d(node1, 3, 1, data_format) + \
-    separable_conv2d(node2, 64, 3, 1, data_format, is_training)
-  node6 = separable_conv2d(node1, 64, 3, 1, data_format, is_training) + \
-    average_pooling2d(node2, 3, 1, data_format)
-  node7 = separable_conv2d(node2, 64, 3, 1, data_format, is_training) + \
-    average_pooling2d(node1, 3, 1, data_format)
+  filters = params['filters']
+  dag = params['conv_dag']
 
-  output = tf.concat([node3, node4, node5, node6, node7], axis=1 if data_format == 'channels_first' else 3)
-  output = tf.layers.conv2d(
-    inputs=output, filters=64, kernel_size=1, strides=1,
-    padding='SAME', use_bias=False,
-    kernel_initializer=tf.variance_scaling_initializer(),
-    data_format=data_format)
-  output = tf.nn.relu(batch_normalization(output, data_format, is_training))
+  assert num_nodes == len(dag), 'num_nodes of convolution cell is not equal to number of nodes in convolution DAG!'
+
+  h = {}
+  leaf_nodes = ['node_%d' % i for i in xrange(1, num_nodes+1)]
+  for i in xrange(1, num_nodes+1):
+    name = 'node_%d' % i
+    with tf.variable_scope(name):
+      node = dag[name]
+      assert name == node.name, 'name incompatible with node.name'
+      if i == 1:
+        h[name] = last_inputs
+        continue
+      elif i == 2:
+        h[name] = inputs
+        continue
+      previous_node_1, previous_node_2 = node.previous_node_1, node.previous_node_2
+      input_1, input_2 = h[previous_node_1], h[previous_node_2]
+      if previous_node_1 in leaf_nodes:
+        leaf_nodes.remove(previous_node_1)
+      if previous_node_2 in leaf_nodes:
+        leaf_nodes.remove(previous_node_2)
+      operation_1, operation_2 = node.operation_1, node.operation_2
+      with tf.variable_scope('input_1'):
+        output_1 = _OPERATIONS[operation_1](input_1, filters, 1, data_format, is_training)
+      with tf.variable_scope('input_2'):
+        output_2 = _OPERATIONS[operation_2](input_2, filters, 1, data_format, is_training)
+      output = tf.identity(output_1 + output_2, 'output')
+      h[name] = output
+  tf.logging.info(leaf_nodes)
+  output = tf.concat([h[name] for name in leaf_nodes], axis=1 if data_format == 'channels_first' else 3, name='concat_leaf_nodes_output')
+  with tf.variable_scope('cell_output'):
+    output = tf.layers.conv2d(
+      inputs=output, filters=64, kernel_size=1, strides=1,
+      padding='SAME', use_bias=False,
+      kernel_initializer=tf.variance_scaling_initializer(),
+      data_format=data_format)
+    output = tf.nn.relu(batch_normalization(output, data_format, is_training))
   return inputs, output
   
 
-def reduction_cell(last_inputs, inputs, params):
+def reduction_cell(last_inputs, inputs, params, is_training):
   # node 1 and node 2 are last_inputs and inputs respectively
   # begin processing from node 3
+  num_nodes = params['num_nodes']
   data_format = params['data_format']
-  is_training = params['is_training']
-  node1 = last_inputs
-  node2 = inputs
-  node3 = separable_conv2d(node1, 64, 5, 2, data_format, is_training) + \
-    average_pooling2d(node2, 3, 2, data_format)
-  node4 = separable_conv2d(node2, 64, 3, 2, data_format, is_training) + \
-    average_pooling2d(node2, 3, 2, data_format)
-  node5 = average_pooling2d(node2, 64, 2, data_format) + \
-    separable_conv2d(node2, 64, 3, 2, data_format, is_training)
-  node6 = separable_conv2d(node5, 64, 5, 2, data_format, is_training) + \
-    average_pooling2d(node2, 3, 2, data_format)
-  node7 = separable_conv2d(node6, 64, 3, 2, data_format, is_training) + \ 
-    separable_conv2d(node1, 64, 5, 2, data_format, is_training)
-  output = tf.concat([node3, node4, node7], axis=1 if data_format == 'channels_first' else 3)
-  output = tf.layers.conv2d(
-    inputs=output, filters=64, kernel_size=1, strides=1,
-    padding='SAME', use_bias=False,
-    kernel_initializer=tf.variance_scaling_initializer(),
-    data_format=data_format)
-  output = tf.nn.relu(batch_normalization(output, data_format, is_training))
+  filters = params['filters']
+  dag = params['reduc_dag']
+  
+  assert num_nodes == len(dag), 'num_nodes is not equal to number of nodes in reduction DAG!'
+
+  h = {}
+  leaf_nodes = ['node_%d' % i for i in xrange(1, num_nodes+1)]
+  for i in xrange(1, num_nodes+1):
+    name = 'node_%d' % i
+    with tf.variable_scope(name):
+      node = dag[name]
+      assert name == node.name, 'name incompatible with node.name'
+      if i == 1:
+        h[name] = last_inputs
+      elif i == 2:
+        h[name] = inputs
+      else:
+        previous_node_1, previous_node_2 = node.previous_node_1, node.previous_node_2
+        input_1, input_2 = h[previous_node_1], h[previous_node_2]
+        if previous_node_1 in leaf_nodes:
+          leaf_nodes.remove(previous_node_1)
+        if previous_node_2 in leaf_nodes:
+          leaf_nodes.remove(previous_node_2)
+        operation_1, operation_2 = node.operation_1, node.operation_2
+        with tf.variable_scope('input_1'):
+          output_1 = _OPERATIONS[operation_1](input_1, filters, 2 if previous_node_1 in ['node_1', 'node_2'] else 1, data_format, is_training)
+        with tf.variable_scope('input_2'):
+          output_2 = _OPERATIONS[operation_2](input_2, filters, 2 if previous_node_2 in ['node_1', 'node_2'] else 1, data_format, is_training)
+        output = tf.identity(output_1 + output_2, 'output')
+        h[name] = output
+  tf.logging.info(leaf_nodes)
+  output = tf.concat([h[name] for name in leaf_nodes], axis=1 if data_format == 'channels_first' else 3, name='concat_leaf_nodes_output')
+  with tf.variable_scope('cell_output'):
+    output = tf.layers.conv2d(
+      inputs=output, filters=64, kernel_size=1, strides=1,
+      padding='SAME', use_bias=False,
+      kernel_initializer=tf.variance_scaling_initializer(),
+      data_format=data_format)
+    output = tf.nn.relu(batch_normalization(output, data_format, is_training))
   return inputs, output
 
-def build_block(inputs, params):
+def build_block(inputs, params, is_training):
   num_cells = params['num_cells']
-  data_format = params['data_format']
-  is_training = params['is_training']
-  inputs = tf.layers.conv2d(
-    inputs=inputs, filters=64, kernel_size=1, strides=1,
-    padding='SAME', use_bias=False,
-    kernel_initializer=tf.variance_scaling_initializer(),
-    data_format=data_format)
-  inputs = tf.nn.relu(batch_normalization(inputs, data_format, is_training))
   # first convolution_cell
-  last_inputs, inputs = convolution_cell(last_inputs=inputs, inputs=inputs, params=params)
-  for _ in xrange(1, num_cells):
-    last_inputs, inputs = convolution_cell(last_inputs=last_inputs, inputs=inputs, params=params)
-  last_inputs, inputs = reduction_cell(last_inputs=last_inputs, inputs=inputs, params=params)
+  with tf.variable_scope('convolution_cell_1'):
+    last_inputs, inputs = convolution_cell(inputs, inputs, params, is_training)
+  for i in xrange(1, num_cells):
+    with tf.variable_scope('convolution_cell_%d' % (i+1)):
+      last_inputs, inputs = convolution_cell(last_inputs, inputs, params, is_training)
+  if params['reduc_dag'] is not None:
+    with tf.variable_scope('reduction_cell'):
+      last_inputs, inputs = reduction_cell(last_inputs, inputs, params, is_training)
   return inputs
 
-def build_model(num_blocks, num_cells, num_nodes, num_classes, data_format=None):
+def build_model(params):
   """Generator for net.
 
   Args:
-  num_blocks: A single integer for the number of blocks.
-  num_cells: A single integer for the number of convolution cells.
-  num_nodes: A single integer for the number of nodes.
-  num_classes: The number of possible classes for image classification.
-  data_format: The input format ('channels_last', 'channels_first', or None).
-    If set to None, the format is dependent on whether a GPU is available.
+  params: A dict containing following keys:
+    num_blocks: A single integer for the number of blocks.
+    num_cells: A single integer for the number of convolution cells.
+    num_nodes: A single integer for the number of nodes.
+    num_classes: The number of possible classes for image classification.
+    filters: The numer of filters
+    conv_dag: The DAG of the convolution cell
+    reduc_dag: The DAG of the reduction cell
+    data_format: The input format ('channels_last', 'channels_first', or None).
+      If set to None, the format is dependent on whether a GPU is available.
 
   Returns:
   The model function that takes in `inputs` and `is_training` and
   returns the output tensor of the model.
   """
-
-  if data_format is None:
-    data_format = (
+  if params['data_format'] is None:
+    params['data_format'] = (
       'channels_first' if tf.test.is_built_with_cuda() else 'channels_last')
 
+  data_format = params['data_format']
+  num_classes = params['num_classes']
+  
   def model(inputs, is_training):
     if data_format == 'channels_first':
       # Convert the inputs from channels_last (NHWC) to channels_first (NCHW).
       # This provides a large performance boost on GPU. See
       # https://www.tensorflow.org/performance/performance_guide#data_formats
       inputs = tf.transpose(inputs, [0, 3, 1, 2])
-
-    params = {
-      'num_blocks': num_blocks,
-      'num_cells': num_cells,
-      'num_nodes': num_nodes,
-      'data_format': data_format,
-      'is_training': is_training,
-    }
-
-    inputs = build_block(inputs=inputs, params=params)
-    inputs = tf.layers.average_pooling2d(
-      inputs=inputs, pool_size=16, strides=1, padding='VALID', data_format=data_format)
-    inputs = tf.identity(inputs, 'final_avg_pool')
-    inputs = tf.reshape(inputs, [-1, 256])
-    inputs = tf.layers.dense(inputs=inputs, units=num_classes)
-    inputs = tf.identity(inputs, 'final_dense')
+ 
+    with tf.variable_scope('body'):
+      with tf.variable_scope('input_convonlution'):
+        inputs = tf.layers.conv2d(
+          inputs=inputs, filters=64, kernel_size=1, strides=1,
+          padding='SAME', use_bias=False,
+          kernel_initializer=tf.variance_scaling_initializer(),
+          data_format=data_format)
+        inputs = tf.nn.relu(batch_normalization(inputs, data_format, is_training))
+      with tf.variable_scope('block'):
+        inputs = build_block(inputs, params, is_training)
+      with tf.variable_scope('final_global_average_pooling'):
+        inputs = tf.layers.average_pooling2d(
+          inputs=inputs, pool_size=16, strides=1, padding='VALID', data_format=data_format)
+      inputs = tf.reshape(inputs, [-1, 64])
+      with tf.variable_scope('fully_connected_layer'):
+        inputs = tf.layers.dense(inputs=inputs, units=num_classes)
     return inputs
 
   return model

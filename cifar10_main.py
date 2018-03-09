@@ -21,10 +21,12 @@ from __future__ import print_function
 import argparse
 import os
 import sys
-
+import numpy as np
 import tensorflow as tf
+from collections import namedtuple
 
 import model
+#import model_new as model
 
 parser = argparse.ArgumentParser()
 
@@ -34,6 +36,18 @@ parser.add_argument('--data_dir', type=str, default='/tmp/cifar10_data',
 
 parser.add_argument('--model_dir', type=str, default='/tmp/cifar10_model',
                     help='The directory where the model will be stored.')
+
+parser.add_argument('--num_blocks', type=int, default=1,
+                    help='The number of the blocks.')
+
+parser.add_argument('--num_cells', type=int, default=6,
+                    help='The number of convolution cells in a block.')
+
+parser.add_argument('--num_nodes', type=int, default=7,
+                    help='The number of nodes in a cell.')
+
+parser.add_argument('--filters', type=int, default=64,
+                    help='The numer of filters.')
 
 parser.add_argument('--train_epochs', type=int, default=250,
                     help='The number of epochs to train.')
@@ -188,18 +202,29 @@ def input_fn(is_training, data_dir, batch_size, num_epochs=1):
 
   return images, labels
 
+def _log_variable_sizes(var_list, tag):
+  """Log the sizes and shapes of variables, and the total size.
+
+    Args:
+      var_list: a list of varaibles
+      tag: a string
+  """
+  name_to_var = {v.name: v for v in var_list}
+  total_size = 0
+  for v_name in sorted(list(name_to_var)):
+    v = name_to_var[v_name]
+    v_size = int(np.prod(np.array(v.shape.as_list())))
+    tf.logging.info("Weight    %s\tshape    %s\tsize    %d",
+      v.name[:-2].ljust(80),
+      str(v.shape).ljust(20), v_size)
+    total_size += v_size
+  tf.logging.info("%s Total size: %d", tag, total_size)
 
 def cifar10_model_fn(features, labels, mode, params):
   """Model function for CIFAR-10."""
   tf.summary.image('images', features, max_outputs=6)
 
-  network = model.build_model(
-    num_blocks = 1,
-    num_cells = 6,
-    num_nodes = 7,
-    num_classes = _NUM_CLASSES,
-    data_format = params['data_format'])
-
+  network = model.build_model(params)
   inputs = tf.reshape(features, [-1, _HEIGHT, _WIDTH, _DEPTH])
   logits = network(inputs, mode == tf.estimator.ModeKeys.TRAIN)
 
@@ -223,25 +248,38 @@ def cifar10_model_fn(features, labels, mode, params):
   loss = cross_entropy + _WEIGHT_DECAY * tf.add_n(
       [tf.nn.l2_loss(v) for v in tf.trainable_variables()])
 
+
+  _log_variable_sizes(tf.trainable_variables(), "Trainable Variables")
+
   if mode == tf.estimator.ModeKeys.TRAIN:
     # Scale the learning rate linearly with the batch size. When the batch size
     # is 128, the learning rate should be 0.1.
+    
     lr_max = params['lr_max']
     lr_min = params['lr_min']
-    T_0 = params['T_0']
-    T_mul = params['T_mul']
+    T_0 = tf.constant(params['T_0'], dtype=tf.float32)
+    T_mul = tf.constant(params['T_mul'], dtype=tf.float32)
     batches_per_epoch = _NUM_IMAGES['train'] / params['batch_size']
     
     global_step = tf.train.get_or_create_global_step()
-    cur_epoch = global_step * batches_per_epoch + 1
-    cur_i = tf.ceil(tf.log((T_mul - 1) * (cur_epoch / T_0 + 1)) / tf.log(2.0) - 1)
-    cur_i = tf.cast(cur_i, dtype=tf.int32)
-    T_beg = T_0 * (tf.pow(T_mul, cur_i) - 1) / (T_mul - 1)
+    cur_epoch = tf.cast(global_step, dtype=tf.float32) / batches_per_epoch + 1.0
+    cur_i = tf.ceil(tf.log((T_mul - 1.0) * (cur_epoch / T_0 + 1.0)) / tf.log(2.0) - 1.0)
+    T_beg = T_0 * (tf.pow(T_mul, cur_i) - 1.0) / (T_mul - 1.0)
     T_i = T_0 * tf.pow(T_mul, cur_i)
-    T_end = T_beg + T_end
     
     T_cur = cur_epoch - T_beg
-    learning_rate = lr_min + 0.5 * (lr_max - lr_min) * (1 + tf.cos(T_cur / T_i * np.pi))
+    learning_rate = lr_min + 0.5 * (lr_max - lr_min) * (1.0 + tf.cos(T_cur / T_i * np.pi))
+    
+    """
+    initial_learning_rate = 0.1 * params['batch_size'] / 128
+    batches_per_epoch = _NUM_IMAGES['train'] / params['batch_size']
+    global_step = tf.train.get_or_create_global_step()
+    # Multiply the learning rate by 0.1 at 100, 150, and 200 epochs.
+    boundaries = [int(batches_per_epoch * epoch) for epoch in [100, 150, 200]]
+    values = [initial_learning_rate * decay for decay in [1, 0.1, 0.01, 0.001]]
+    learning_rate = tf.train.piecewise_constant(
+      tf.cast(global_step, tf.int32), boundaries, values)
+    """
 
     # Create a tensor named learning_rate for logging purposes
     tf.identity(learning_rate, name='learning_rate')
@@ -278,17 +316,45 @@ def main(unused_argv):
   # Using the Winograd non-fused algorithms provides a small performance boost.
   os.environ['TF_ENABLE_WINOGRAD_NONFUSED'] = '1'
 
+  conv_dag = {
+    'node_1': model.Node('node_1', None, None, None, None),
+    'node_2': model.Node('node_2', None, None, None, None),
+    'node_3': model.Node('node_3', 'node_2', 'node_2', 'sep_conv 3x3', 'identity'),
+    'node_4': model.Node('node_4', 'node_2', 'node_1', 'sep_conv 5x5', 'identity'),
+    'node_5': model.Node('node_5', 'node_1', 'node_2', 'avg_pool 3x3', 'sep_conv 3x3'),
+    'node_6': model.Node('node_6', 'node_1', 'node_2', 'sep_conv 3x3', 'avg_pool 3x3'),
+    'node_7': model.Node('node_7', 'node_2', 'node_1', 'sep_conv 5x5', 'avg_pool 3x3'),
+    }
+
+  reduc_dag = {
+    'node_1': model.Node('node_1', None, None, None, None),
+    'node_2': model.Node('node_2', None, None, None, None),
+    'node_3': model.Node('node_3', 'node_1', 'node_2', 'sep_conv 5x5', 'avg_pool 3x3'),
+    'node_4': model.Node('node_4', 'node_2', 'node_2', 'sep_conv 3x3', 'avg_pool 3x3'),
+    'node_5': model.Node('node_5', 'node_2', 'node_2', 'avg_pool 3x3', 'sep_conv 3x3'),
+    'node_6': model.Node('node_6', 'node_5', 'node_2', 'sep_conv 5x5', 'avg_pool 3x3'),
+    'node_7': model.Node('node_7', 'node_6', 'node_1', 'sep_conv 3x3', 'sep_conv 5x5'),
+    }
   # Set up a RunConfig to only save checkpoints once per training cycle.
   run_config = tf.estimator.RunConfig().replace(save_checkpoints_secs=1e9)
   cifar_classifier = tf.estimator.Estimator(
       model_fn=cifar10_model_fn, model_dir=FLAGS.model_dir, config=run_config,
       params={
-          'data_format': FLAGS.data_format,
-          'batch_size': FLAGS.batch_size,
-          'T_0': FLAGS.T_0,
-          'T_mul': FLAGS.T_mul,
-          'lr_max': FLAGS.lr_max,
-          'lr_min': FLAGS.lr_min
+        'num_blocks': FLAGS.num_blocks,
+        'num_cells': FLAGS.num_cells,
+        'num_nodes': FLAGS.num_nodes,
+        'num_classes': _NUM_CLASSES,
+        'filters': FLAGS.filters,
+        'conv_dag': conv_dag,
+        'reduc_dag': reduc_dag,
+        'data_format': FLAGS.data_format,
+        'batch_size': FLAGS.batch_size,
+        'T_0': FLAGS.T_0,
+        'T_mul': FLAGS.T_mul,
+        'lr_max': FLAGS.lr_max,
+        'lr_min': FLAGS.lr_min,
+        'conv_dag': conv_dag,
+        'reduc_dag': reduc_dag,
       })
 
   for _ in range(FLAGS.train_epochs // FLAGS.epochs_per_eval):
