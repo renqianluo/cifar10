@@ -18,19 +18,19 @@ from __future__ import division
 from __future__ import print_function
 
 from six.moves import xrange
-from collections import namedtuple
+from collections import namedtuple, OrderedDict
 import tensorflow as tf
 
 _BATCH_NORM_DECAY = 0.997
 _BATCH_NORM_EPSILON = 1e-5
 
-_OPERATIONS={
-  'identity': lambda inputs, filters, strides, data_format, is_training : tf.identity(inputs),
-  'sep_conv 5x5': lambda inputs, filters, strides, data_format, is_training : separable_conv2d(inputs, filters, 5, strides, data_format, is_training),
-  'sep_conv 3x3': lambda inputs, filters, strides, data_format, is_training : separable_conv2d(inputs, filters, 3, strides, data_format, is_training),
-  'avg_pool 3x3': lambda inputs, filters, strides, data_format, is_training : average_pooling2d(inputs, 3, strides, data_format),
-  'max_pool 3x3': lambda inputs, filters, strides, data_format, is_training : max_pooling2d(inputs, 3, strides, data_format),
-}
+_OPERATIONS=OrderedDict()
+_OPERATIONS['identity'] = lambda inputs, filters, strides, data_format, is_training : tf.identity(inputs)
+_OPERATIONS['sep_conv 5x5'] = lambda inputs, filters, strides, data_format, is_training : separable_conv2d(inputs, filters, 5, strides, data_format, is_training)
+_OPERATIONS['sep_conv 3x3'] = lambda inputs, filters, strides, data_format, is_training : separable_conv2d(inputs, filters, 3, strides, data_format, is_training)
+_OPERATIONS['avg_pool 3x3'] = lambda inputs, filters, strides, data_format, is_training : average_pooling2d(inputs, 3, strides, data_format)
+_OPERATIONS['max_pool 3x3'] = lambda inputs, filters, strides, data_format, is_training : max_pooling2d(inputs, 3, strides, data_format)
+
 
 Node = namedtuple('Node', ['name', 'previous_node_1', 'previous_node_2', 'operation_1', 'operation_2'])
 
@@ -68,10 +68,10 @@ def batch_normalization(inputs, data_format, is_training):
   return inputs
 
 def separable_conv2d(inputs, filters, kernel_size, strides, data_format, is_training):
+  inputs = tf.nn.relu(inputs)
+  
   if strides > 1:
     inputs = fixed_padding(inputs, kernel_size, data_format)
-
-  inputs = tf.nn.relu(inputs)
 
   inputs = tf.layers.separable_conv2d(
     inputs=inputs, filters=filters, kernel_size=kernel_size, strides=strides,
@@ -79,10 +79,18 @@ def separable_conv2d(inputs, filters, kernel_size, strides, data_format, is_trai
     depthwise_initializer=tf.variance_scaling_initializer(),
     pointwise_initializer=tf.variance_scaling_initializer(),
     data_format=data_format)
+  
+  if strides > 1:
+    inputs = fixed_padding(inputs, kernel_size, data_format)
+  
+  inputs = tf.layers.separable_conv2d(
+    inputs=inputs, filters=filters, kernel_size=kernel_size, strides=1,
+    padding=('SAME' if strides == 1 else 'VALID'), use_bias=False,
+    depthwise_initializer=tf.variance_scaling_initializer(),
+    pointwise_initializer=tf.variance_scaling_initializer(),
+    data_format=data_format)
 
   inputs = batch_normalization(inputs, data_format, is_training)
-
-  if strides > 1:
 
   return inputs
 

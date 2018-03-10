@@ -23,10 +23,10 @@ import os
 import sys
 import numpy as np
 import tensorflow as tf
-from collections import namedtuple
+from collections import OrderedDict
+import json
 
 import model
-#import model_new as model
 
 parser = argparse.ArgumentParser()
 
@@ -57,6 +57,9 @@ parser.add_argument('--epochs_per_eval', type=int, default=10,
 
 parser.add_argument('--batch_size', type=int, default=128,
                     help='The number of images per batch.')
+
+parser.add_argument('--random_dag', type=bool, default=False,
+                    help='Random sample a dag to run.')
 
 parser.add_argument(
     '--data_format', type=str, default=None,
@@ -311,30 +314,54 @@ def cifar10_model_fn(features, labels, mode, params):
       train_op=train_op,
       eval_metric_ops=metrics)
 
+def get_dag(num_cells):
+  dag = OrderedDict()
+  operations = list(model._OPERAIONS.keys())
+  num_operations = len(operations)
+  for i in xrange(1, num_cells+1):
+    name = 'node_%d' % i
+    if i == 1 or i == 2:
+      node = model.Node(name, None, None, None, None)
+    else:
+      p_node_1 = 'node_%d' % random.randint(1, i-1) 
+      p_node_2 = 'node_%d' % random.randint(1, i-1)
+      op1 = operations[random.randint(1, num_operations)]  
+      op2 = operations[random.randint(1, num_operations)]  
+      node = model.Node(name, p_node_1, p_node_2, op1, op2)
+    dag[name] = node
+  return dag
 
 def main(unused_argv):
   # Using the Winograd non-fused algorithms provides a small performance boost.
   os.environ['TF_ENABLE_WINOGRAD_NONFUSED'] = '1'
 
-  conv_dag = {
-    'node_1': model.Node('node_1', None, None, None, None),
-    'node_2': model.Node('node_2', None, None, None, None),
-    'node_3': model.Node('node_3', 'node_2', 'node_2', 'sep_conv 3x3', 'identity'),
-    'node_4': model.Node('node_4', 'node_2', 'node_1', 'sep_conv 5x5', 'identity'),
-    'node_5': model.Node('node_5', 'node_1', 'node_2', 'avg_pool 3x3', 'sep_conv 3x3'),
-    'node_6': model.Node('node_6', 'node_1', 'node_2', 'sep_conv 3x3', 'avg_pool 3x3'),
-    'node_7': model.Node('node_7', 'node_2', 'node_1', 'sep_conv 5x5', 'avg_pool 3x3'),
-    }
-
-  reduc_dag = {
-    'node_1': model.Node('node_1', None, None, None, None),
-    'node_2': model.Node('node_2', None, None, None, None),
-    'node_3': model.Node('node_3', 'node_1', 'node_2', 'sep_conv 5x5', 'avg_pool 3x3'),
-    'node_4': model.Node('node_4', 'node_2', 'node_2', 'sep_conv 3x3', 'avg_pool 3x3'),
-    'node_5': model.Node('node_5', 'node_2', 'node_2', 'avg_pool 3x3', 'sep_conv 3x3'),
-    'node_6': model.Node('node_6', 'node_5', 'node_2', 'sep_conv 5x5', 'avg_pool 3x3'),
-    'node_7': model.Node('node_7', 'node_6', 'node_1', 'sep_conv 3x3', 'sep_conv 5x5'),
-    }
+  if FLAGS.random_dag:
+    conv_dag = get_dag(FLAGS.num_cells)
+    reduc_dag = get_dag(FLAGS.num_cells) 
+  else:
+    conv_dag = OrderedDict()
+    conv_dag['node_1'] = model.Node('node_1', None, None, None, None)
+    conv_dag['node_2'] = model.Node('node_2', None, None, None, None)
+    conv_dag['node_3'] = model.Node('node_3', 'node_2', 'node_2', 'sep_conv 3x3', 'identity')
+    conv_dag['node_4'] = model.Node('node_4', 'node_2', 'node_1', 'sep_conv 5x5', 'identity')
+    conv_dag['node_5'] = model.Node('node_5', 'node_1', 'node_2', 'avg_pool 3x3', 'sep_conv 3x3')
+    conv_dag['node_6'] = model.Node('node_6', 'node_1', 'node_2', 'sep_conv 3x3', 'avg_pool 3x3')
+    conv_dag['node_7'] = model.Node('node_7', 'node_2', 'node_1', 'sep_conv 5x5', 'avg_pool 3x3')
+    reduc_dag = OrderedDict()
+    reduc_dag['node_1'] = model.Node('node_1', None, None, None, None)
+    reduc_dag['node_2'] = model.Node('node_2', None, None, None, None)
+    reduc_dag['node_3'] = model.Node('node_3', 'node_1', 'node_2', 'sep_conv 5x5', 'avg_pool 3x3')
+    reduc_dag['node_4'] = model.Node('node_4', 'node_2', 'node_2', 'sep_conv 3x3', 'avg_pool 3x3')
+    reduc_dag['node_5'] = model.Node('node_5', 'node_2', 'node_2', 'avg_pool 3x3', 'sep_conv 3x3')
+    reduc_dag['node_6'] = model.Node('node_6', 'node_5', 'node_2', 'sep_conv 5x5', 'avg_pool 3x3')
+    reduc_dag['node_7'] = model.Node('node_7', 'node_6', 'node_1', 'sep_conv 3x3', 'sep_conv 5x5')
+  
+  with open(os.path.joint(FLAGS.model_dir, 'model_dag.json'), 'w') as f:
+    dag = OrderedDict()
+    dag['conv_dag'] = conv_dag
+    dag['reduc_dag'] = reduc_dag
+    json.dump(dag, f)
+  
   # Set up a RunConfig to only save checkpoints once per training cycle.
   run_config = tf.estimator.RunConfig().replace(save_checkpoints_secs=1e9)
   cifar_classifier = tf.estimator.Estimator(
